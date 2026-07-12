@@ -1,0 +1,40 @@
+{
+  "backup": {
+    "db": "/path/to/DISCORD_BACKUP-<id>/backup.db",
+    "dir": "/path/to/DISCORD_BACKUP-<id>"
+  },
+  "schema_path": "/path/to/fluxer/tools/dev/cassandra_target_schema.json",
+  "emoji_data_path": "",
+  "klipy_api_key": "your-klipy-api-key",
+  "media_proxy_endpoint": "https://your.instance/media",
+  "media_proxy_secret": "FLUXER_MEDIA_PROXY_SECRET_KEY from your deployment",
+  "postgres": {
+    "host": "127.0.0.1",
+    "port": 5432,
+    "database": "fluxer",
+    "username": "fluxer",
+    "password": "CHANGE_ME",
+    "kv_table": "fluxer_kv"
+  },
+  "s3": {
+    "endpoint": "http://127.0.0.1:8333",
+    "region": "us-east-1",
+    "access_key": "fluxer",
+    "secret_key": "CHANGE_ME",
+    "bucket_cdn": "fluxer",
+    "force_path_style": true
+  },
+  "owner_user_id": 0,
+  "options": {
+    "thread_mode": "channel",
+    "thread_name_prefix": "🧵 ",
+    "reaction_mode": "owner",
+    "unmapped_author_mode": "owner",
+    "upload_attachments": true,
+    "convert_gifs": false
+  },
+  "user_map": {
+    "_comment": "Run `gen-user-map` to populate this from the backup, then set each fluxer_user_id (0 = skip). The shorthand \"<discord_id>\": <fluxer_user_id> is also accepted.",
+    "000000000000000000": {"name": "example user", "fluxer_user_id": 0}
+  }
+}

@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Per-server configs hold live credentials — never commit them.
+# Only the template is tracked.
+*.json
+!config.example.json
+
+# Per-machine agent context (paths, which config). Template is tracked.
+CLAUDE.local.md
+
+# Run artifacts / logs
+*.log
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
