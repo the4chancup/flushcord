@@ -238,6 +238,36 @@ def preflight(cfg, owner_id=None, want_s3=True):
             except Exception as e:  # noqa: BLE001
                 warn(f"could not reach KLIPY to verify the api key: {e}")
 
+    # YouTube embeds: key works, and the media proxy that supplies the
+    # thumbnail's metadata is configured. Opt-in by setting youtube_api_key --
+    # so when it's absent, say what the backup will lose rather than stay quiet.
+    if cfg.youtube_api_key:
+        try:
+            from youtube import YouTubeClient
+            probe = YouTubeClient(cfg.youtube_api_key, verbose=True)
+            if probe._fetch("dQw4w9WgXcQ"):
+                ok("YouTube api key works (videos.list returned a video)")
+            else:
+                bad("YouTube api key set but videos.list returned nothing — the "
+                    "key is invalid, or the YouTube Data API v3 is not enabled "
+                    "for its project")
+        except Exception as e:  # noqa: BLE001
+            warn(f"could not reach the YouTube Data API to verify the key: {e}")
+        if not (cfg.media_proxy_endpoint and cfg.media_proxy_secret):
+            warn("youtube_api_key is set but media_proxy_endpoint/media_proxy_secret "
+                 "is not; YouTube thumbnails will migrate without a ThumbHash "
+                 "placeholder or content hash")
+    elif db is not None:
+        try:
+            from youtube import is_youtube_url
+            n = sum(1 for (u,) in db.conn.execute("SELECT url FROM embeds")
+                    if is_youtube_url(u))
+            if n:
+                warn(f"{n} YouTube link(s) in the backup but no youtube_api_key set; "
+                     "they will migrate as bare title cards (no player, no image)")
+        except Exception:  # noqa: BLE001
+            pass  # advisory only; never fail preflight on it
+
     # 8. Owner set + valid
     if not owner_id:
         bad("no guild owner set — pass `--owner <fluxer_user_id>` "
