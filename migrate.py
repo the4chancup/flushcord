@@ -393,7 +393,32 @@ class Migrator:
                 {"user_id": fid, "guild_id": self.guild_id},
             )
             count += 1
+        self._invalidate_member_index(count)
         print(f"Migrated {count} guild members")
+
+    def _invalidate_member_index(self, member_count):
+        """Force Fluxer to rebuild the guild's member search index.
+
+        The members page is served from a search index, not from
+        `guild_members`: the app indexes each member as it joins
+        (`addUserToGuild` -> `searchIndexService.indexMember`). Rows written
+        straight into KV never pass through that, so migrated members would be
+        missing from the page (and its role filters) even though the sidebar,
+        which the gateway builds from `guild_members`, shows them.
+
+        Fluxer self-heals — but only while the guild looks un-indexed:
+        `guildMembersNeedReindexing()` (GuildMemberIndexingUtils.ts) is true
+        exactly when `members_indexed_at` is unset, and the members-page
+        controller then queues Fluxer's own `indexGuildMembers` job. Anything
+        that already indexed this guild (e.g. opening the page mid-migration)
+        stamps `members_indexed_at` and would otherwise pin the index to that
+        stale snapshot forever. Clearing it re-arms the lazy re-index.
+        """
+        self.kv.patch(
+            "guilds",
+            {"guild_id": self.guild_id},
+            {"member_count": member_count, "members_indexed_at": None},
+        )
 
     # -- channels / threads -------------------------------------------------
 
@@ -1162,6 +1187,55 @@ def verify(cfg):
     kv.close()
 
 
+def reindex_members(cfg):
+    """Re-arm Fluxer's member search index for an already-migrated guild.
+
+    Same repair as `_invalidate_member_index`, for instances migrated before
+    this existed (or indexed mid-migration): clears `members_indexed_at` and
+    resets `member_count` from the rows actually present. Fluxer queues its own
+    `indexGuildMembers` job the next time someone opens the members page.
+    """
+    schema = Schema(cfg.schema_path)
+    kv = KvStore(schema, cfg.pg_dsn, cfg.kv_table)
+    with kv.conn.cursor() as cur:
+        cur.execute(
+            f"SELECT row_data FROM {kv._ident} WHERE table_name = 'guilds'"
+        )
+        guilds = [r[0] for r in cur.fetchall()]
+        cur.execute(
+            f"SELECT row_data FROM {kv._ident} WHERE table_name = 'guild_members'"
+        )
+        members = [r[0] for r in cur.fetchall()]
+    if not guilds:
+        kv.close()
+        sys.exit("No guilds row in Fluxer — nothing to re-index.")
+    for g in guilds:
+        guild_id = _tagged_int(g.get("guild_id"))
+        count = sum(1 for m in members
+                    if _tagged_int(m.get("guild_id")) == guild_id)
+        was = g.get("members_indexed_at")
+        kv.patch(
+            "guilds",
+            {"guild_id": guild_id},
+            {"member_count": count, "members_indexed_at": None},
+        )
+        print(f"Guild {guild_id}: member_count -> {count}, cleared "
+              f"members_indexed_at ({'was ' + str(_tagged_value(was)) if was else 'was already unset'})")
+    kv.commit()
+    kv.close()
+    print("\nOpen the guild's members page in Fluxer to trigger the re-index.")
+
+
+def _tagged_value(v):
+    """Unwrap a tagged-JSON value ({'__fluxer_type':..,'value':..}) if tagged."""
+    return v.get("value") if isinstance(v, dict) else v
+
+
+def _tagged_int(v):
+    v = _tagged_value(v)
+    return int(v) if v is not None else None
+
+
 def gif_report(cfg):
     """Resolve every Tenor embed against KLIPY without touching the database.
 
@@ -1364,6 +1438,11 @@ def main():
                         "embeds so they render (repairs a migration run done before "
                         "media-proxy signing was configured)")
 
+    sub.add_parser("reindex-members",
+                   help="make Fluxer rebuild the guild's member search index, so "
+                        "migrated members show up on the members page with their "
+                        "roles (repairs a guild indexed before/during migration)")
+
     pg = sub.add_parser(
         "purge", help="delete everything the migration created (for a clean re-run)"
     )
@@ -1386,6 +1465,9 @@ def main():
         return
     if args.cmd == "fix-gifs":
         fix_gif_embeds(cfg)
+        return
+    if args.cmd == "reindex-members":
+        reindex_members(cfg)
         return
     if args.cmd == "preflight":
         owner = args.owner or cfg.guild_owner_user_id or None

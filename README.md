@@ -113,6 +113,16 @@ scheme the app uses (`attachments/{channel_id}/{attachment_id}/{filename}`).
 - **Join times.** The backup has no per-member join timestamp, so `joined_at`
   is set to each member's earliest message time (falling back to guild creation
   time).
+- **Member search index.** Fluxer's *members page* is served from a search
+  index, not from `guild_members` — the app indexes each member as it joins, a
+  step direct KV writes bypass. Fluxer rebuilds the index by itself, but only
+  while the guild still looks un-indexed, so the migration clears the guild's
+  `members_indexed_at` marker to re-arm that. (The member *sidebar* is separate:
+  the gateway builds it from `guild_members`, which is why members can show up
+  there but be missing from the members page.) If a guild was indexed
+  before/during its migration — e.g. someone opened the members page mid-run —
+  its index is pinned to that stale snapshot and members appear missing or
+  without roles; run `reindex-members` to fix it.
 
 ## Prerequisites
 
@@ -218,6 +228,17 @@ Tenor link and fills the cache, so the real migration is faster:
 ```
 
 Prints Discord backup counts next to the migrated row counts in `fluxer_kv`.
+
+### Members missing (or role-less) on the members page
+
+```bash
+.venv/bin/python migrate.py --config myserver.json reindex-members
+```
+
+Clears the guild's `members_indexed_at` and resets `member_count` from the rows
+actually present, so Fluxer queues its own member-indexing job the next time
+someone opens the members page. Needed only if the guild's member index was
+built before/during the migration; a normal migration re-arms this on its own.
 
 ### Resetting for a clean re-run
 
