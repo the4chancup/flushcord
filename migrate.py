@@ -46,6 +46,7 @@ from klipy import (
     sign_media_proxy_url,
     slug_from_share_url,
 )
+from youtube import YouTubeClient, is_youtube_url
 
 MENTION_USER_RE = re.compile(r"<@!?(\d+)>")
 MENTION_ROLE_RE = re.compile(r"<@&(\d+)>")
@@ -301,8 +302,23 @@ class Migrator:
             print("  ! convert_gifs is on but no KLIPY api key resolved; "
                   "Tenor embeds will be left as-is")
         self._gif_misses = []  # (message_id, tenor_url) with no KLIPY match
+        # YouTube links -> real Fluxer video embeds (player + sized thumbnail),
+        # rebuilt from the YouTube Data API like Fluxer's own unfurler. On when
+        # a key is set; without media_proxy_* the thumbnail loses its ThumbHash.
+        self._youtube = None
+        if cfg.youtube_api_key:
+            self._youtube = YouTubeClient(
+                cfg.youtube_api_key,
+                media_proxy_endpoint=cfg.media_proxy_endpoint or None,
+                media_proxy_secret=cfg.media_proxy_secret or None,
+                cache_path=cfg.youtube_cache_path or None,
+            )
+            if not (cfg.media_proxy_endpoint and cfg.media_proxy_secret):
+                print("  ! youtube_api_key is set but media_proxy_* is not; "
+                      "thumbnails will have no placeholder/content hash")
         self.stats = {"messages": 0, "attachments": 0, "reactions": 0,
-                      "skipped": 0, "gifs": 0, "gif_misses": 0}
+                      "skipped": 0, "gifs": 0, "gif_misses": 0,
+                      "youtube": 0, "youtube_misses": 0}
 
     def close(self):
         self.db.close()
@@ -782,6 +798,12 @@ class Migrator:
         Tenor GIF embeds are converted to KLIPY ``gifv`` embeds when possible
         (and the Tenor link in the content is swapped for the KLIPY share URL);
         an unmatched Tenor embed is left as its original rich embed and logged.
+
+        YouTube embeds are rebuilt from the YouTube Data API into the ``video``
+        embed Fluxer would have produced. Only links Discord itself unfurled are
+        touched: a link Discord left bare (``<url>`` syntax, a code block, a dead
+        video) has no embed row, and stays bare. A video that no longer resolves
+        keeps its original rich embed and is logged.
         """
         out = []
         for e in self.db.embeds(message_id):
@@ -795,6 +817,13 @@ class Migrator:
                     continue
                 self.stats["gif_misses"] += 1
                 self._gif_misses.append((message_id, url))
+            elif self._youtube and is_youtube_url(url):
+                video = self._youtube.resolve_embed(url)
+                if video:
+                    out.append(video)
+                    self.stats["youtube"] += 1
+                    continue
+                self.stats["youtube_misses"] += 1
             out.append(self._rich_embed(e))
         return out, content
 
@@ -1062,6 +1091,11 @@ class Migrator:
                   f"{self.stats['gif_misses']} unmatched "
                   f"({self._klipy.api_calls} API calls)")
             self._report_gif_misses()
+        if self._youtube:
+            self._youtube.save_cache()
+            print(f"YouTube: {self.stats['youtube']} embeds rebuilt, "
+                  f"{self.stats['youtube_misses']} unresolved "
+                  f"({self._youtube.api_calls} API calls)")
         print("\nDone. Stats:", json.dumps(self.stats))
 
     def _report_gif_misses(self):
@@ -1400,6 +1434,84 @@ def fix_gif_embeds(cfg):
           f"KLIPY API calls: {client.api_calls}.")
 
 
+def fix_youtube_embeds(cfg, dry_run=False):
+    """Rebuild migrated YouTube embeds in place (for an instance already migrated).
+
+    Same conversion `migrate` now does, applied to rows already in the database:
+    each flat ``rich`` embed pointing at a YouTube link becomes the ``video``
+    embed Fluxer's own unfurler would have written — player, sized thumbnail,
+    ThumbHash placeholder. Videos that no longer resolve keep their rich embed.
+
+    Only the ``embeds`` field of an affected message is rewritten; ids,
+    timestamps, authorship and content are untouched.
+    """
+    if not cfg.youtube_api_key:
+        sys.exit("No YouTube api key resolved. Set youtube_api_key in the config.")
+    if not (cfg.media_proxy_endpoint and cfg.media_proxy_secret):
+        print("  ! media_proxy_* is not configured; thumbnails will have no "
+              "placeholder/content hash")
+
+    client = YouTubeClient(
+        cfg.youtube_api_key,
+        media_proxy_endpoint=cfg.media_proxy_endpoint or None,
+        media_proxy_secret=cfg.media_proxy_secret or None,
+        cache_path=cfg.youtube_cache_path or None,
+    )
+    conn = psycopg2.connect(cfg.pg_dsn)
+    tbl = cfg.kv_table
+    rebuilt = unresolved = rows_changed = 0
+
+    with conn.cursor() as read_cur:
+        read_cur.execute(
+            f"SELECT row_key, row_data FROM {tbl} WHERE table_name='messages'"
+        )
+        batch = read_cur.fetchall()
+
+    print(f"Scanning {len(batch)} message row(s) for YouTube embeds to rebuild...")
+    write = conn.cursor()
+    for i, (row_key, row_data) in enumerate(batch, 1):
+        data = row_data if isinstance(row_data, dict) else json.loads(row_data)
+        embeds = data.get("embeds")
+        if not embeds:
+            continue
+        changed = False
+        for idx, embed in enumerate(embeds):
+            url = embed.get("url") or ""
+            # Already a rebuilt video embed? Leave it alone.
+            if embed.get("type") == "video" or not is_youtube_url(url):
+                continue
+            video = client.resolve_embed(url)
+            if video:
+                embeds[idx] = video
+                rebuilt += 1
+                changed = True
+            else:
+                unresolved += 1
+        if changed and not dry_run:
+            data["embeds"] = embeds
+            write.execute(
+                f"UPDATE {tbl} SET row_data = %s::jsonb, updated_at = now() "
+                f"WHERE table_name='messages' AND row_key = %s",
+                (json.dumps(data, ensure_ascii=False), row_key),
+            )
+        if changed:
+            rows_changed += 1
+        if i % 5000 == 0:
+            if not dry_run:
+                conn.commit()
+            client.save_cache()
+            print(f"  {i}/{len(batch)} scanned ({rebuilt} rebuilt)", flush=True)
+
+    if not dry_run:
+        conn.commit()
+    client.save_cache()
+    write.close()
+    conn.close()
+    what = "would update" if dry_run else "updated"
+    print(f"\nDone. Rows {what}: {rows_changed}; embeds rebuilt: {rebuilt}; "
+          f"unresolved: {unresolved}; YouTube API calls: {client.api_calls}.")
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -1443,6 +1555,13 @@ def main():
                         "migrated members show up on the members page with their "
                         "roles (repairs a guild indexed before/during migration)")
 
+    fy = sub.add_parser("fix-youtube",
+                        help="rebuild already-migrated YouTube embeds into real "
+                             "Fluxer video embeds (player + sized thumbnail), for an "
+                             "instance migrated before youtube_api_key was set")
+    fy.add_argument("--dry-run", action="store_true",
+                    help="resolve and report without writing to the DB")
+
     pg = sub.add_parser(
         "purge", help="delete everything the migration created (for a clean re-run)"
     )
@@ -1468,6 +1587,9 @@ def main():
         return
     if args.cmd == "reindex-members":
         reindex_members(cfg)
+        return
+    if args.cmd == "fix-youtube":
+        fix_youtube_embeds(cfg, dry_run=args.dry_run)
         return
     if args.cmd == "preflight":
         owner = args.owner or cfg.guild_owner_user_id or None

@@ -51,10 +51,27 @@ Paths are relative to the local Fluxer checkout.
 | Allowed message types | `migrate.py` (`ALLOWED_MESSAGE_TYPES`) | `MessageTypeSchema`; search serializer calls `contentType.trim()` (so content type must never be null) |
 | Unicode emoji FE0F form | `unicode_emojis.py` | `fluxer_app/src/media/data/emojis.json` |
 | GIF → KLIPY + proxy-URL signing | `klipy.py` | `fluxer_gifs/src/media_proxy.rs` (`external_proxy_url`); `fluxer_gifs/src/klipy.rs` |
-| **Embed render contract** (easy to miss) | embeds built in `migrate.py` / `klipy.py` | `fluxer_app/src/features/channel/components/embeds/channel_embed/ChannelEmbedShared.ts` — `isValidMedia` requires `proxy_url` **and** `url` **and** `width` **and** `height`; `.../EmbedMediaRenderer.tsx`; `packages/schema/src/domains/message/EmbedSchemas.ts` |
+| YouTube link → `video` embed | `youtube.py` | `fluxer_unfurl/src/resolvers/youtube.rs`; limits in `fluxer_unfurl/src/{embed_normalizer,text_limits}.rs`; thumbnail metadata via `/_metadata` (`fluxer_unfurl/src/media_proxy.rs`) |
+| **Embed render contract** (easy to miss) | embeds built in `migrate.py` / `klipy.py` / `youtube.py` | `fluxer_app/src/features/channel/components/embeds/channel_embed/ChannelEmbedShared.ts` — `isValidMedia` requires `proxy_url` **and** `url` **and** `width` **and** `height`; `.../EmbedMediaRenderer.tsx`; `packages/schema/src/domains/message/EmbedSchemas.ts` |
 
 `README.md`'s "Module layout" has a one-line summary of each module; this table
 adds the exact Fluxer file to read when touching it.
+
+### Persisted embed ≠ served embed
+
+The row you write is **not** what the client sees, and conflating the two will
+send you chasing the wrong field:
+
+- **`proxy_url` is never persisted.** `EmbedService.mapResponseMedia`
+  (`fluxer_api/.../infrastructure/EmbedService.ts`) strips it before the row is
+  written, and `fluxer_messages` re-signs it from `media.url` on *every* read
+  (`map_embed_media` → `external_media_proxy_url` in `src/shard_impl.rs`). So a
+  `proxy_url` you store is inert — the server overwrites it. What a stored media
+  object actually needs to render is **`url` + `width` + `height`**; the server
+  supplies the `proxy_url` half of `isValidMedia` on its own.
+- Verify embed shape against a **real row Fluxer wrote** (post the link in the
+  instance, then read `fluxer_kv`), not against the resolver source — a couple of
+  fields get normalized on the way in (e.g. `provider.url` gains a trailing slash).
 
 ## Safety invariants
 
@@ -74,9 +91,14 @@ adds the exact Fluxer file to read when touching it.
 
 - Run everything with `.venv/bin/python` (deps in `requirements.txt`).
 - **There is no test suite.** Verify against a scratch/dev Fluxer instance:
-  `preflight` → `migrate --dry-run` → `verify` (plus `gif-report` / `fix-gifs`
-  for GIF conversion). Never run `migrate`/`purge` against production without a
-  `--dry-run` first.
+  `preflight` → `migrate --dry-run` → `verify`. Never run `migrate`/`purge`
+  against production without a `--dry-run` first.
+- **New conversion? Ship the repair command with it.** Anything that enriches
+  rows (GIFs, member index, YouTube embeds) needs an in-place fixer for guilds
+  already migrated — re-migrating is not an option once people are using the
+  instance. See `fix-gifs`, `reindex-members`, `fix-youtube` in `migrate.py`, and
+  README's "Repairing an already-migrated guild". They rewrite one field of the
+  affected rows and must be idempotent.
 
 ## Machine-specific context
 

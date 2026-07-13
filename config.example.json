@@ -6,6 +6,7 @@
   "schema_path": "/path/to/fluxer/tools/dev/cassandra_target_schema.json",
   "emoji_data_path": "",
   "klipy_api_key": "your-klipy-api-key",
+  "youtube_api_key": "your-youtube-data-api-v3-key",
   "media_proxy_endpoint": "https://your.instance/media",
   "media_proxy_secret": "FLUXER_MEDIA_PROXY_SECRET_KEY from your deployment",
   "postgres": {

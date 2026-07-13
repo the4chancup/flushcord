@@ -110,6 +110,22 @@ scheme the app uses (`attachments/{channel_id}/{attachment_id}/{filename}`).
   (your deployment's `FLUXER_MEDIA_PROXY_PUBLIC_ENDPOINT` /
   `FLUXER_MEDIA_PROXY_SECRET_KEY`). If you migrated GIFs before setting these,
   run `fix-gifs` to backfill `proxy_url` on the existing embeds in place.
+- **YouTube embeds.** Discord's backup keeps a YouTube link as a flat `rich`
+  embed — a title, a description, and a thumbnail *url* with no dimensions —
+  which Fluxer renders as a title card with no player and no image (the client
+  drops media it can't size). Setting `youtube_api_key` (a [YouTube Data API v3
+  key](https://console.cloud.google.com/apis/library/youtube.googleapis.com))
+  makes the migration rebuild each one into the real `video` embed Fluxer's own
+  unfurler would have written: inline player, sized thumbnail with a ThumbHash
+  placeholder, channel as author. The thumbnail's metadata comes from the same
+  media-proxy call Fluxer makes, so `media_proxy_endpoint` / `media_proxy_secret`
+  should be set too. Resolutions are cached on disk (`youtube_cache_path`), so a
+  video linked many times costs one API call (1 quota unit of the default
+  10,000/day) and re-runs are free. Videos that no longer resolve (deleted,
+  private) keep their original rich embed. Only links Discord itself unfurled are
+  converted — one Discord suppressed (`<url>`, a code block) stays bare, as it was.
+  If you migrated before setting the key, run `fix-youtube` to convert the
+  existing embeds in place.
 - **Join times.** The backup has no per-member join timestamp, so `joined_at`
   is set to each member's earliest message time (falling back to guild creation
   time).
@@ -157,7 +173,7 @@ cp config.example.json myserver.json
 ```
 
 Sections: `backup` (`db`, `dir`), `schema_path`, `klipy_api_key`,
-`media_proxy_endpoint`, `media_proxy_secret`,
+`youtube_api_key`, `media_proxy_endpoint`, `media_proxy_secret`,
 `postgres`, `s3`, `owner_user_id`, `options` (`thread_mode`,
 `thread_name_prefix`, `reaction_mode`, `unmapped_author_mode`,
 `upload_attachments`, `convert_gifs`), and `user_map`. The file holds
@@ -229,6 +245,31 @@ Tenor link and fills the cache, so the real migration is faster:
 
 Prints Discord backup counts next to the migrated row counts in `fluxer_kv`.
 
+## Repairing an already-migrated guild
+
+**A normal `migrate` does all of this as it goes** — these commands exist to fix a
+guild that was migrated *before* the relevant config was in place (or, for
+members, one whose index got built mid-run). They're safe to re-run: each is
+idempotent, and none of them touch message ids, timestamps, authorship or
+content.
+
+| Symptom in the app | Command |
+|---|---|
+| GIFs show as bare links instead of playing | `fix-gifs` |
+| Members page shows too few members, or members without roles | `reindex-members` |
+| YouTube links show as a title card with no player or image | `fix-youtube` |
+
+### GIFs render as bare links
+
+```bash
+.venv/bin/python migrate.py --config myserver.json fix-gifs
+```
+
+Repairs converted GIF embeds whose media lacks the dimensions Fluxer's client
+needs to render it, and re-resolves degraded `rich` embeds back into proper
+`gifv` ones. Needed only if `media_proxy_endpoint` / `media_proxy_secret` weren't
+set at migration time.
+
 ### Members missing (or role-less) on the members page
 
 ```bash
@@ -237,10 +278,25 @@ Prints Discord backup counts next to the migrated row counts in `fluxer_kv`.
 
 Clears the guild's `members_indexed_at` and resets `member_count` from the rows
 actually present, so Fluxer queues its own member-indexing job the next time
-someone opens the members page. Needed only if the guild's member index was
-built before/during the migration; a normal migration re-arms this on its own.
+someone opens the members page. Needed only if the guild's member index was built
+before/during the migration — e.g. someone opened the members page mid-run, which
+pins the index to that partial snapshot permanently.
 
-### Resetting for a clean re-run
+### YouTube links showing as a bare title card
+
+```bash
+.venv/bin/python migrate.py --config myserver.json fix-youtube --dry-run
+.venv/bin/python migrate.py --config myserver.json fix-youtube
+```
+
+Rebuilds migrated YouTube embeds into real Fluxer `video` embeds (inline player,
+sized thumbnail with a ThumbHash), rewriting only the `embeds` field of each
+affected message. Needed only if the guild was migrated before `youtube_api_key`
+was set. Videos that no longer resolve (deleted, private) keep their existing
+embed. `--dry-run` reports what it would change without writing, and fills the
+resolution cache, so the real run costs no extra API quota.
+
+## Resetting for a clean re-run
 
 ```bash
 .venv/bin/python migrate.py --config myserver.json purge --s3        # delete DB rows + uploaded files
@@ -303,6 +359,8 @@ owner (the backup has no per-asset creator).
 - `kvstore.py` — psycopg2 upsert/patch into `fluxer_kv`
 - `unicode_emojis.py` — normalises unicode emojis (content + reactions) to Fluxer's canonical surrogate
 - `discord_db.py` — read-only Discord backup access
+- `klipy.py` — Tenor → KLIPY GIF conversion (mirrors `fluxer_gifs`)
+- `youtube.py` — YouTube link → `video` embed (mirrors `fluxer_unfurl`'s resolver)
 - `s3uploader.py` — attachment uploads to the CDN bucket
 - `config.py` — loads the per-server `config.json`
 - `migrate.py` — orchestrator + CLI

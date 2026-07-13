@@ -60,6 +60,14 @@ class Config:
     # Disk cache of resolved query -> embed (dedupes reposts, makes re-runs free).
     # Defaults to <backup_dir>/klipy_cache.json.
     klipy_cache_path: str = ""
+    # Rebuild YouTube embeds from the YouTube Data API, the way Fluxer's own
+    # unfurler does — Discord's backup only keeps a flat rich embed, with no
+    # player and an unsized thumbnail the client refuses to render. Enabled by
+    # setting a key; also needs media_proxy_* for the thumbnail's metadata.
+    youtube_api_key: str = ""     # YouTube Data API v3 key (inline in the config)
+    # Disk cache of resolved video id -> embed. Defaults to
+    # <backup_dir>/youtube_cache.json.
+    youtube_cache_path: str = ""
     # Fluxer media-proxy signing (FLUXER_MEDIA_PROXY_PUBLIC_ENDPOINT / _SECRET_KEY
     # in the deployment). Required so converted GIF embeds carry a signed
     # proxy_url; without it Fluxer's client won't render the media.
@@ -146,6 +154,13 @@ def load_config(config_path):
     c.klipy_cache_path = opts.get("klipy_cache_path", c.klipy_cache_path) \
         or os.path.join(c.backup_dir, "klipy_cache.json")
     c.klipy_api_key = (data.get("klipy_api_key", "") or "").strip()
+
+    # YouTube embed rebuilding. On whenever a key is present.
+    c.youtube_cache_path = opts.get("youtube_cache_path", c.youtube_cache_path) \
+        or os.path.join(c.backup_dir, "youtube_cache.json")
+    c.youtube_api_key = (data.get("youtube_api_key", "") or ""
+                         or os.environ.get("FLUXER_YOUTUBE_API_KEY", "")
+                         or os.environ.get("YOUTUBE_API_KEY", "")).strip()
 
     # Media-proxy signing: top-level config keys, falling back to the same env
     # vars the Fluxer deployment uses.
