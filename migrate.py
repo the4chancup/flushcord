@@ -1469,7 +1469,7 @@ def fix_guild_icon(cfg, dry_run=False):
         if old_key and old_key != new_key:
             s3.delete_key(old_key)
             print(f"Deleted previous icon {old_key}")
-        print("Reload the guild (_reload_guild.py / admin API) — the gateway "
+        print("Reload the guild (admin API: POST /admin/guilds/{id}/reloads) — the gateway "
               "caches guild state.")
     except Exception:
         kv.rollback()
