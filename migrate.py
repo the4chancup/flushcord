@@ -268,6 +268,22 @@ def preflight(cfg, owner_id=None, want_s3=True):
         except Exception:  # noqa: BLE001
             pass  # advisory only; never fail preflight on it
 
+    # 7b. @everyone role: stored in the backup, or its permissions configured
+    try:
+        db_ev = DiscordBackup(cfg.backup_db)
+        gid = int(db_ev.guild()["id"])
+        has_everyone = any(int(r["id"]) == gid for r in db_ev.roles())
+        db_ev.close()
+        if has_everyone:
+            ok("@everyone role present in the backup")
+        elif cfg.everyone_permissions:
+            ok(f"@everyone role will be created (permissions {cfg.everyone_permissions})")
+        else:
+            bad("the backup has no @everyone role and `everyone_permissions` is not set: "
+                "role-less members would get no base permissions")
+    except Exception as e:  # noqa: BLE001
+        bad(f"could not check the @everyone role: {e}")
+
     # 8. Owner set + valid
     if not owner_id:
         bad("no guild owner set — pass `--owner <fluxer_user_id>` "
@@ -405,6 +421,23 @@ class Migrator:
             }
             self.kv.upsert("guild_roles", row)
         print(f"Migrated {len(roles)} roles")
+        if not any(int(r["id"]) == self.guild_id for r in roles):
+            # Same shape as the @everyone row Fluxer writes when it creates a guild.
+            self.kv.upsert("guild_roles", {
+                "guild_id": self.guild_id,
+                "role_id": self.guild_id,
+                "name": "@everyone",
+                "permissions": self.cfg.everyone_permissions,
+                "position": 0,
+                "color": 0,
+                "hoist": False,
+                "hoist_position": None,
+                "icon_hash": None,
+                "unicode_emoji": None,
+                "mentionable": False,
+                "version": 1,
+            })
+            print(f"Added @everyone role (permissions {self.cfg.everyone_permissions})")
 
     def migrate_members(self):
         join_ms = self.db.earliest_message_ms_by_author()

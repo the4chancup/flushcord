@@ -43,6 +43,11 @@ class Config:
 
     # --- Migration target identifiers ---
     guild_owner_user_id: int = 0  # Fluxer user id that owns the imported guild
+    # Permissions of the guild's @everyone role (role id == guild id). DiscoReaper
+    # backups don't store that role; without it role-less members get no base
+    # permissions. Take Discord's value (GET /guilds/{id}/roles) and add the
+    # Fluxer-only VIEW_CHANNEL_MEMBERS bit (1 << 54) Discord has no equivalent of.
+    everyone_permissions: int = 0
 
     # --- Strategies ---
     thread_mode: str = "channel"
@@ -139,6 +144,8 @@ def load_config(config_path):
 
     if data.get("owner_user_id"):
         c.guild_owner_user_id = int(data["owner_user_id"])
+    if data.get("everyone_permissions"):
+        c.everyone_permissions = int(data["everyone_permissions"])
 
     opts = _section(data, "options")
     c.thread_mode = opts.get("thread_mode", c.thread_mode)
