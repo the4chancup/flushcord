@@ -258,6 +258,7 @@ content.
 | GIFs show as bare links instead of playing | `fix-gifs` |
 | Members page shows too few members, or members without roles | `reindex-members` |
 | YouTube links show as a title card with no player or image | `fix-youtube` |
+| Guild has no icon (or still shows a manually-uploaded one) | `fix-icon` |
 
 ### GIFs render as bare links
 
@@ -295,6 +296,20 @@ affected message. Needed only if the guild was migrated before `youtube_api_key`
 was set. Videos that no longer resolve (deleted, private) keep their existing
 embed. `--dry-run` reports what it would change without writing, and fills the
 resolution cache, so the real run costs no extra API quota.
+
+### Guild icon missing
+
+```bash
+.venv/bin/python migrate.py --config myserver.json fix-icon --dry-run
+.venv/bin/python migrate.py --config myserver.json fix-icon
+```
+
+Uploads the backup's `server_assets/server_icon.png` the way Fluxer itself does
+(metadata-stripped PNG at `icons/<guild>/<md5[:8]>`), sets `icon_hash` on the
+guild row, and deletes the previously uploaded icon object if it differs. Needed
+for guilds migrated before icons were imported, or to replace a hand-uploaded
+temporary icon. `--dry-run` reports the old/new hash without writing. Reload the
+guild afterwards — the gateway caches guild state.
 
 ## Resetting for a clean re-run
 

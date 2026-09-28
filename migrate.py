@@ -21,12 +21,14 @@ Run `python migrate.py --config <file> <subcommand> --help` for options.
 """
 
 import argparse
+import hashlib
 import io
 import json
 import mimetypes
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 
@@ -69,6 +71,77 @@ class MessageAttachmentFlags:
 # (e.g. 18 THREAD_CREATED, 21 THREAD_STARTER_MESSAGE, 20 APPLICATION_COMMAND)
 # that Fluxer's response schema rejects, 500-ing the whole channel fetch.
 ALLOWED_MESSAGE_TYPES = frozenset({0, 1, 2, 3, 4, 5, 6, 7, 19})
+
+# Guild icons mirror EntityAssetService.prepareAssetUpload ('icon'/'guild'):
+# icon_hash = md5(original bytes)[:8], S3 key icons/{guild_id}/{hash}, stored
+# body = stripPngMetadataChunks(original), content type application/octet-stream
+# (what Fluxer's icon objects read back as). 10 MiB avatar_max_size default.
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+PNG_CHUNKS_TO_KEEP = frozenset({
+    "IHDR", "PLTE", "IDAT", "IEND", "tRNS", "gAMA", "cHRM", "sRGB",
+    "iCCP", "cICP", "acTL", "fcTL", "fdAT",
+})
+ICON_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _png_chunk_types(data):
+    """Yield (type, offset, end) for each chunk; raises on a truncated chunk."""
+    off = len(PNG_SIGNATURE)
+    while off + 12 <= len(data):
+        (length,) = struct.unpack(">I", data[off:off + 4])
+        end = off + 12 + length
+        if end > len(data):
+            raise ValueError("Invalid PNG chunk length while stripping metadata")
+        ctype = data[off + 4:off + 8].decode("latin-1")
+        yield ctype, off, end
+        off = end
+        if ctype == "IEND":
+            break
+
+
+def strip_png_metadata_chunks(data):
+    """Byte-parity with Fluxer stripPngMetadataChunks (StorageObjectHelpers.ts):
+    keep the signature and every chunk whose type is in PNG_CHUNKS_TO_KEEP or is
+    critical (uppercase first letter); drop the rest; stop after IEND."""
+    if not data.startswith(PNG_SIGNATURE):
+        return data
+    out = bytearray(data[:len(PNG_SIGNATURE)])
+    for ctype, off, end in _png_chunk_types(data):
+        if ctype in PNG_CHUNKS_TO_KEEP or 0x41 <= ord(ctype[0]) <= 0x5A:
+            out += data[off:end]
+        if ctype == "IEND":
+            break
+    return bytes(out)
+
+
+def prepare_guild_icon(path):
+    """Read + validate a backup server icon. Returns (hash, body) like Fluxer's
+    prepareAssetUpload, or None after printing why it was skipped."""
+    data = open(path, "rb").read()
+    if len(data) > ICON_MAX_BYTES:
+        print(f"  ! guild icon {os.path.basename(path)} is {len(data)} bytes "
+              f"(>10 MiB limit); skipped")
+        return None
+    if not data.startswith(PNG_SIGNATURE):
+        print(f"  ! guild icon {os.path.basename(path)} is not a PNG; skipped "
+              "(only static PNG icons are migrated)")
+        return None
+    try:
+        types = [t for t, _, _ in _png_chunk_types(data)]
+    except ValueError:
+        print(f"  ! guild icon {os.path.basename(path)} has a truncated chunk; skipped")
+        return None
+    if "acTL" in types:
+        print(f"  ! guild icon {os.path.basename(path)} is an animated PNG "
+              "(acTL chunk); skipped")
+        return None
+    digest = hashlib.md5(data).hexdigest()[:8]
+    try:
+        body = strip_png_metadata_chunks(data)
+    except ValueError:
+        # Fluxer logs and uploads the original on strip failure; same here.
+        body = data
+    return digest, body
 
 
 def coerce_message_type(raw):
@@ -162,6 +235,22 @@ def preflight(cfg, owner_id=None, want_s3=True):
         else:
             warn(f"backup media dir not found ({cfg.backup_dir}); "
                  "attachments with missing files will be skipped")
+        if db is not None:
+            g = db.guild() or {}
+            icon_file = g.get("icon_file")
+            if icon_file:
+                icon_path = os.path.join(cfg.backup_dir, icon_file)
+                if os.path.exists(icon_path):
+                    size = os.path.getsize(icon_path)
+                    with open(icon_path, "rb") as fh:
+                        head = fh.read(len(PNG_SIGNATURE))
+                    if not head.startswith(PNG_SIGNATURE):
+                        warn("guild icon is not a PNG; it won't be migrated")
+                    elif size > ICON_MAX_BYTES:
+                        warn(f"guild icon is {size} bytes (>10 MiB limit); "
+                             "it won't be migrated")
+                    else:
+                        ok("guild icon is a migratable PNG")
 
     # 4. Postgres reachable + KV table exists
     conn = None
@@ -401,8 +490,35 @@ class Migrator:
             "member_count": len(self.user_map),
             "version": 1,
         }
+        if self.s3:
+            icon_hash = self._upload_guild_icon()
+            if icon_hash:
+                row["icon_hash"] = icon_hash
         self.kv.upsert("guilds", row)
         print(f"Guild '{row['name']}' ({self.guild_id}) -> owner {self.owner_id}")
+
+    def _guild_icon_path(self):
+        g = self.db.guild() or {}
+        icon_file = g.get("icon_file")
+        if not icon_file:
+            return None
+        p = os.path.join(self.cfg.backup_dir, icon_file)
+        return p if os.path.exists(p) else None
+
+    def _upload_guild_icon(self):
+        """Upload the backup's server icon to icons/{guild_id}/{md5[:8]},
+        Fluxer's keying (EntityAssetService.prepareAssetUpload). Returns the
+        icon hash, or None when there's nothing usable."""
+        path = self._guild_icon_path()
+        if not path:
+            return None
+        prepared = prepare_guild_icon(path)
+        if prepared is None:
+            return None
+        digest, body = prepared
+        self.s3.upload_bytes(body, f"icons/{self.guild_id}/{digest}", "application/octet-stream")
+        print(f"Guild icon: icons/{self.guild_id}/{digest} ({len(body)} bytes)")
+        return digest
 
     def migrate_roles(self):
         roles = self.db.roles()
@@ -1206,6 +1322,9 @@ class Migrator:
         print(f"Purging guild {gid}: {len(channel_ids)} channels, "
               f"{len(emoji_ids)} emojis, {len(sticker_ids)} stickers"
               + (" (dry-run)" if dry_run else ""))
+        if purge_s3 and dry_run:
+            print(f"  S3: would delete attachments/, emojis/, stickers/ and "
+                  f"the icons/{gid}/ prefix")
         tbl = self.kv._ident
         total = 0
         with self.kv.conn.cursor() as cur:
@@ -1251,8 +1370,10 @@ class Migrator:
                 s3.delete_key(f"emojis/{eid}")
             for sid in sticker_ids:
                 s3.delete_key(f"stickers/{sid}")
+            icon_removed = s3.delete_prefix(f"icons/{gid}/")
             print(f"S3 objects deleted: {removed} attachments + "
-                  f"{len(emoji_ids)} emojis + {len(sticker_ids)} stickers")
+                  f"{len(emoji_ids)} emojis + {len(sticker_ids)} stickers + "
+                  f"{icon_removed} guild icon(s)")
 
 
 def _now():
@@ -1283,6 +1404,82 @@ def verify(cfg):
             )
             print(f"  Fluxer {table:18}:", cur.fetchone()[0])
     kv.close()
+
+
+def fix_guild_icon(cfg, dry_run=False):
+    """Set `icon_hash` on an already-migrated guild from the backup's server
+    icon, Fluxer's way (EntityAssetService.prepareAssetUpload): upload the
+    metadata-stripped PNG to icons/{guild_id}/{md5[:8]}, patch the guilds row,
+    then delete the previous icon object. Idempotent; --dry-run writes nothing
+    (no S3 upload either)."""
+    db = DiscordBackup(cfg.backup_db)
+    g = db.guild()
+    if not g:
+        sys.exit("No guild_profile row in backup.")
+    gid = int(g["id"])
+    path = None
+    if g.get("icon_file"):
+        p = os.path.join(cfg.backup_dir, g["icon_file"])
+        if os.path.exists(p):
+            path = p
+    if not path:
+        sys.exit("Backup has no server icon on disk — nothing to set.")
+    prepared = prepare_guild_icon(path)
+    if prepared is None:
+        sys.exit("Icon not usable; see above.")
+    new_hash, body = prepared
+
+    schema = Schema(cfg.schema_path)
+    kv = KvStore(schema, cfg.pg_dsn, cfg.kv_table)
+    try:
+        spec = kv.schema.table("guilds")
+        key = {"guild_id": gid}
+        row_key = kv._row_key(spec, key)
+        before = kv._get_raw("guilds", row_key)
+        if before is None:
+            sys.exit(f"Guild {gid} has no row in {cfg.kv_table} — run migrate first.")
+        old_hash = _tagged_value(before.get("icon_hash"))
+        if old_hash == new_hash:
+            print(f"Guild {gid}: icon already set (icons/{gid}/{new_hash})")
+            kv.close()
+            return
+        old_key = f"icons/{gid}/{old_hash[2:] if old_hash and old_hash.startswith('a_') else old_hash}" if old_hash else None
+        new_key = f"icons/{gid}/{new_hash}"
+        if dry_run:
+            print(f"Guild {gid}: icon_hash {old_hash or '<unset>'} -> {new_hash}")
+            print(f"  would upload {new_key} ({len(body)} bytes, stripped)")
+            if old_key and old_key != new_key:
+                print(f"  would delete previous {old_key}")
+            kv.rollback()
+            return
+        s3 = S3Uploader(cfg)
+        s3.upload_bytes(body, new_key, "application/octet-stream")
+        print(f"Uploaded {new_key} ({len(body)} bytes)")
+        kv.patch("guilds", key, {"icon_hash": new_hash})
+        kv.commit()
+        after = kv._get_raw("guilds", row_key)
+        changed = sorted(
+            c for c in set(before) | set(after)
+            if before.get(c) != after.get(c)
+        )
+        if changed != ["icon_hash"]:
+            kv.close()
+            sys.exit(f"Unexpected columns changed: {changed} — investigate.")
+        print(f"Guild {gid}: icon_hash {old_hash or '<unset>'} -> {new_hash}")
+        if old_key and old_key != new_key:
+            s3.delete_key(old_key)
+            print(f"Deleted previous icon {old_key}")
+        print("Reload the guild (_reload_guild.py / admin API) — the gateway "
+              "caches guild state.")
+    except Exception:
+        kv.rollback()
+        raise
+    finally:
+        try:
+            kv.close()
+        except Exception:
+            pass
+        db.close()
 
 
 def reindex_members(cfg):
@@ -1619,6 +1816,13 @@ def main():
                         "migrated members show up on the members page with their "
                         "roles (repairs a guild indexed before/during migration)")
 
+    fi = sub.add_parser("fix-icon",
+                        help="set the guild icon on an already-migrated guild "
+                             "from the backup's server icon (repairs guilds "
+                             "migrated before icons were imported)")
+    fi.add_argument("--dry-run", action="store_true",
+                    help="show old/new hash and what would be uploaded; writes nothing")
+
     fy = sub.add_parser("fix-youtube",
                         help="rebuild already-migrated YouTube embeds into real "
                              "Fluxer video embeds (player + sized thumbnail), for an "
@@ -1651,6 +1855,9 @@ def main():
         return
     if args.cmd == "reindex-members":
         reindex_members(cfg)
+        return
+    if args.cmd == "fix-icon":
+        fix_guild_icon(cfg, dry_run=args.dry_run)
         return
     if args.cmd == "fix-youtube":
         fix_youtube_embeds(cfg, dry_run=args.dry_run)

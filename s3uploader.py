@@ -49,6 +49,12 @@ class S3Uploader:
         extra = {"ContentType": content_type} if content_type else {}
         self.client.upload_file(local_path, self.bucket, key, ExtraArgs=extra)
 
+    def upload_bytes(self, body, key, content_type=None):
+        kw = {"Body": body}
+        if content_type:
+            kw["ContentType"] = content_type
+        self.client.put_object(Bucket=self.bucket, Key=key, **kw)
+
     def delete_key(self, key):
         try:
             self.client.delete_object(Bucket=self.bucket, Key=key)
