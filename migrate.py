@@ -564,6 +564,7 @@ class Migrator:
                 "parent_id": int(parent_category) if parent_category else None,
                 "position": 0,
                 "nsfw": False,
+                "permission_overwrites": self._permission_overwrites(int(t["parent_id"])),
                 "version": 1,
             }
             self.kv.upsert("channels", row)
