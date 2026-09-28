@@ -1,12 +1,5 @@
 # flushcord — Discord → Fluxer migration tool
 
-> [!Warning]
-> This entire project was "vibe-coded" (this is likely the only paragraph I actually wrote (AI did fix my grammar since
-> English is not my native language)). I'm normally pretty anti-AI and should be ashamed of doing such a thing, but
-> Claude carried this one purely out of respect for my laziness (and my need to get this done fast). I am quite a
-> privacy-aware person, and between Discord rolling out age verification and the EU pushing Chat Control, I just wanted
-> to stay as private as humanly possible (which is where Fluxer comes in).
-
 Migrates a Discord server backup (SQLite) into a self-hosted **Fluxer** instance,
 preserving original message timestamps, ordering, authorship, channels,
 threads, reactions, and attachments.
