@@ -84,6 +84,43 @@ class KvStore:
         merged.update(patch)
         self.upsert(table_name, merged)
 
+    def delete(self, table_name, key):
+        """Delete a row by primary key (mirrors the executor's `deleteByPk`,
+        which compiles to `DELETE FROM <table> WHERE <pk cols>` i.e. one
+        (table_name, row_key) row in the KV table)."""
+        spec = self.schema.table(table_name)
+        row_key = self._row_key(spec, key)
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM {self._ident} WHERE table_name = %s AND row_key = %s",
+                (table_name, row_key),
+            )
+            return cur.rowcount
+
+    def get(self, table_name, key):
+        """Decoded row by primary key, or None. Only columns the table
+        declares are returned."""
+        spec = self.schema.table(table_name)
+        raw = self._get_raw(table_name, self._row_key(spec, key))
+        if raw is None:
+            return None
+        return {**key, **self._decode_known_columns(spec, raw)}
+
+    def rows_by_field(self, table_name, field, value):
+        """Decoded rows of `table_name` whose `field` equals `value`
+        (same `row_data->field->>'value'` scan shape as purge)."""
+        spec = self.schema.table(table_name)
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f"SELECT row_data FROM {self._ident} WHERE table_name = %s "
+                f"AND row_data->'{field}'->>'value' = %s "
+                "AND (expires_at IS NULL OR expires_at > now())",
+                (table_name, str(value)),
+            )
+            return [
+                self._decode_known_columns(spec, r[0]) for r in cur.fetchall()
+            ]
+
     def exists(self, table_name, key):
         spec = self.schema.table(table_name)
         return self._get_raw(table_name, self._row_key(spec, key)) is not None

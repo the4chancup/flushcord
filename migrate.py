@@ -28,6 +28,7 @@ import mimetypes
 import os
 import re
 import shutil
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -1291,6 +1292,217 @@ class Migrator:
         if len(urls) > 50:
             print(f"    ... and {len(urls) - 50} more")
 
+    # -- import-channels (add backup channels to an existing guild) ---------
+
+    def import_channels(self, channel_ids, relay_state_path=None,
+                        add_members_path=None):
+        """Import the listed backup channels into an already-migrated guild.
+
+        Everything runs in ONE transaction: nothing is committed until the
+        very end (the caller rolls back on --dry-run or exception). The
+        guild-scoped `purge` is never called — it would delete the whole
+        guild.
+
+        `--relay-state DB` points at the live Discord->Bonfire relay's
+        sqlite state (bonfire-bot/relay.py). Messages the relay already
+        posted via webhooks are *kept* on Bonfire and skipped here. Any
+        existing KV `messages` row in a listed channel that is NOT one of
+        those relay copies aborts the import — something else wrote there.
+        """
+        channel_ids = [int(c) for c in channel_ids]
+
+        # (a) the guild must already exist in KV.
+        g = self.db.guild()
+        if not g:
+            sys.exit("No guild_profile row in backup.")
+        self.guild_id = int(g["id"])
+        guild_row = self.kv.get("guilds", {"guild_id": self.guild_id})
+        if not guild_row:
+            sys.exit(f"Guild {self.guild_id} has no 'guilds' row in KV - "
+                     "it was not migrated yet.")
+        if not self.owner_id:
+            # owner_id is unused by this path except as unmapped-author
+            # fallback, which we don't allow anyway; still keep it set.
+            self.owner_id = int(guild_row.get("owner_id") or 0)
+
+        # (b) every channel must be in the backup AND already exist on
+        # Bonfire, in this guild, not soft-deleted.
+        backup_channels = {int(c["id"]) for c in self.db.channels()}
+        for cid in channel_ids:
+            if cid not in backup_channels:
+                sys.exit(f"Channel {cid} is not in the backup's channels table.")
+            row = self.kv.get(
+                "channels", {"channel_id": cid, "soft_deleted": False})
+            if not row or int(row.get("guild_id") or 0) != self.guild_id:
+                sys.exit(f"Channel {cid} does not exist on Bonfire in guild "
+                         f"{self.guild_id} (or is soft-deleted).")
+        threads = [t for t in self.db.threads()
+                   if int(t.get("parent_id") or 0) in channel_ids]
+        if threads:
+            for t in threads:
+                print(f"  thread {t['id']} ({t.get('name')}): "
+                      f"parent {t['parent_id']} is a listed channel")
+            sys.exit("Backup threads under listed channels are not supported.")
+
+        # (c) relay state: ids the relay already posted.
+        skip_ids = set()          # discord message ids to skip
+        relayed_bonfire_ids = set()  # bonfire ids the relay wrote
+        if relay_state_path:
+            rdb = sqlite3.connect(
+                f"file:{relay_state_path}?mode=ro", uri=True)
+            try:
+                q = ",".join("?" * len(channel_ids))
+                for did, bids_json in rdb.execute(
+                        "SELECT discord_id, bonfire_ids FROM messages "
+                        f"WHERE channel_id IN ({q})", channel_ids):
+                    skip_ids.add(int(did))
+                    for b in json.loads(bids_json or "[]"):
+                        relayed_bonfire_ids.add(int(b))
+            finally:
+                rdb.close()
+            print(f"Relay state: {len(skip_ids)} relayed message(s) in the "
+                  f"listed channels")
+
+        # (d) guard: existing KV messages in these channels must all be
+        # relay copies. (A deleted message's `messages` row is removed -
+        # Messages.deleteByPk in MessageDeletionRepository - so posts the
+        # relay deleted again don't trip this.)
+        for cid in channel_ids:
+            existing = self.kv.rows_by_field("messages", "channel_id", cid)
+            alien = [int(r["message_id"]) for r in existing
+                     if int(r["message_id"]) not in relayed_bonfire_ids]
+            if alien:
+                print(f"  channel {cid}: {len(alien)} existing Bonfire "
+                      f"message(s) are not relay copies; first ids: "
+                      f"{alien[:5]}")
+                sys.exit("Refusing to import: channel already has messages.")
+
+        # (e) authors must all be mapped.
+        to_import = {}
+        unmapped = {}
+        for cid in channel_ids:
+            msgs = [m for m in self.db.messages(cid)
+                    if int(m["id"]) not in skip_ids]
+            to_import[cid] = msgs
+            for m in msgs:
+                aid = m.get("author_id")
+                if aid is not None and self.map_user(aid) is None:
+                    unmapped[int(aid)] = unmapped.get(int(aid), 0) + 1
+        if unmapped:
+            for aid, n in sorted(unmapped.items()):
+                print(f"  unmapped author {aid}: {n} message(s)")
+            sys.exit("Aborting: add these Discord ids to user_map first "
+                     "(unmapped_author_mode is ignored here).")
+
+        # (f) optional member import.
+        members_added, members_skipped = 0, []
+        if add_members_path:
+            join_ms = self.db.earliest_message_ms_by_author()
+            guild_created_ms = snowflake_to_ms(self.guild_id)
+            fid_to_did = {int(v): int(k) for k, v in self.user_map.items()}
+            with open(add_members_path, encoding="utf-8") as f:
+                wanted = [int(line) for line in f if line.strip()]
+            for fid in wanted:
+                did = fid_to_did.get(fid)
+                if did is None:
+                    members_skipped.append((fid, "not in user_map"))
+                    continue
+                if self.kv.exists("guild_members",
+                                  {"guild_id": self.guild_id, "user_id": fid}):
+                    members_skipped.append((fid, "already a member"))
+                    continue
+                if self.kv.exists("guild_bans",
+                                  {"guild_id": self.guild_id, "user_id": fid}):
+                    members_skipped.append((fid, "has a guild_bans row"))
+                    continue
+                self.kv.upsert("guild_members", {
+                    "guild_id": self.guild_id,
+                    "user_id": fid,
+                    "joined_at": join_ms.get(did, guild_created_ms),
+                    "nick": None,
+                    "role_ids": None,
+                    "deaf": False,
+                    "mute": False,
+                    "version": 1,
+                })
+                self.kv.upsert("guild_members_by_user_id",
+                               {"user_id": fid, "guild_id": self.guild_id})
+                members_added += 1
+            if members_added:
+                # Re-arm Fluxer's lazy member search indexing
+                # (members_indexed_at unset -> guildMembersNeedReindexing).
+                self.kv.patch(
+                    "guilds", {"guild_id": self.guild_id},
+                    {"member_count": int(guild_row.get("member_count") or 0)
+                                     + members_added,
+                     "members_indexed_at": None})
+            for fid, why in members_skipped:
+                print(f"  member {fid}: skipped ({why})")
+            if members_added:
+                print(f"Members added: {members_added}")
+
+        # (g) import each channel's messages + bucket bookkeeping.
+        att_count = att_bytes = att_missing = 0
+        for cid in channel_ids:
+            buckets = set()
+            for m in to_import[cid]:
+                self._migrate_one_message(m, cid, buckets)
+            for b in buckets:
+                self.kv.upsert("channel_message_buckets",
+                               {"channel_id": cid, "bucket": b,
+                                "updated_at": _now()})
+                # Fluxer deletes the empty-bucket marker on every message
+                # write (MessageDataRepository.markBucketNotEmpty /
+                # upsertMessage).
+                self.kv.delete("channel_empty_buckets",
+                               {"channel_id": cid, "bucket": b})
+            # attachment report (local files)
+            for m in to_import[cid]:
+                for a in self.db.attachments(int(m["id"])):
+                    att_count += 1
+                    media = (self.db.media(a.get("local_hash"))
+                             if a.get("local_hash") else None)
+                    p = (os.path.join(self.cfg.backup_dir, media["local_path"])
+                         if media and media.get("local_path") else None)
+                    if p and os.path.exists(p):
+                        att_bytes += os.path.getsize(p)
+                    else:
+                        att_missing += 1
+
+        # (h) channel_state + channels.last_message_id, forward-only.
+        for cid, (last_id, last_bucket) in self.channel_last.items():
+            st = self.kv.get("channel_state", {"channel_id": cid}) or {}
+            prev = int(st.get("last_message_id") or 0)
+            patch = {
+                "has_messages": True,
+                "created_bucket": st.get("created_bucket")
+                if st.get("created_bucket") is not None else make_bucket(cid),
+                "updated_at": _now(),
+            }
+            if last_id > prev:
+                patch["last_message_id"] = last_id
+                patch["last_message_bucket"] = last_bucket
+            self.kv.patch("channel_state", {"channel_id": cid}, patch)
+            ch = self.kv.get(
+                "channels", {"channel_id": cid, "soft_deleted": False}) or {}
+            ch_prev = int(ch.get("last_message_id") or 0)
+            ch_patch = {"indexed_at": None}  # re-arm lazy message indexing
+            if last_id > ch_prev:
+                ch_patch["last_message_id"] = last_id
+            self.kv.patch(
+                "channels", {"channel_id": cid, "soft_deleted": False},
+                ch_patch)
+
+        # (j) report
+        for cid in channel_ids:
+            n_backup = len(self.db.messages(cid))
+            n_skip = n_backup - len(to_import[cid])
+            print(f"channel {cid}: {n_backup} backup message(s), "
+                  f"{n_skip} skipped as relayed, {len(to_import[cid])} imported")
+        print(f"attachments: {att_count} ({att_bytes} bytes local, "
+              f"{att_missing} missing local file(s)); "
+              f"reactions written: {self.stats['reactions']}")
+
     # -- purge (reset for a clean re-run) -----------------------------------
 
     # Tables keyed within the guild; deleted by guild_id.
@@ -1830,6 +2042,22 @@ def main():
     fy.add_argument("--dry-run", action="store_true",
                     help="resolve and report without writing to the DB")
 
+    ic = sub.add_parser(
+        "import-channels",
+        help="import specific backup channels into an already-migrated guild "
+             "(adds only messages/buckets/state for those channels; never "
+             "touches guild/roles/channels or calls purge)")
+    ic.add_argument("--channels", required=True,
+                    help="comma-separated Discord channel ids to import")
+    ic.add_argument("--relay-state",
+                    help="path to the live relay's sqlite state db; relayed "
+                         "messages are kept on Bonfire and skipped")
+    ic.add_argument("--add-members",
+                    help="file with one Fluxer user id per line to add as "
+                         "guild members (skipped if already member/banned)")
+    ic.add_argument("--dry-run", action="store_true",
+                    help="no S3 uploads; roll back everything at the end")
+
     pg = sub.add_parser(
         "purge", help="delete everything the migration created (for a clean re-run)"
     )
@@ -1866,6 +2094,27 @@ def main():
         owner = args.owner or cfg.guild_owner_user_id or None
         problems, _ = preflight(cfg, owner_id=owner, want_s3=not args.no_attachments)
         sys.exit(1 if problems else 0)
+    if args.cmd == "import-channels":
+        if args.dry_run:
+            cfg.upload_attachments = False  # no S3 uploads at all
+        channel_ids = [int(x) for x in args.channels.split(",") if x.strip()]
+        m = Migrator(cfg)
+        try:
+            m.import_channels(channel_ids, relay_state_path=args.relay_state,
+                              add_members_path=args.add_members)
+            if args.dry_run:
+                m.kv.rollback()
+                print("Dry run: rolled back")
+            else:
+                m.kv.commit()
+                print("Done")
+        except Exception:
+            m.kv.rollback()
+            raise
+        finally:
+            m.close()
+        return
+
     if args.cmd == "purge":
         m = Migrator(cfg)
         try:
